@@ -1,0 +1,463 @@
+from pathlib import *
+import math
+import copy
+import os
+
+import torch
+import torch.nn as nn
+import snntorch
+from snntorch import surrogate
+from snntorch import backprop
+from snntorch import functional as SF
+from snntorch import utils
+from snntorch import spikeplot as splt
+from snntorch import spikegen
+
+from npx_define import *
+from npx_neuron_type import *
+from npx_cfg_parser import *
+from npx_leaky import NpxLeaky
+
+import npx_app_cfg_generator
+
+class PotentialResult():
+  def __init__(self, pacc:int=0, nacc:int=0, neuron_type:NpxNeuronType=None):
+    self.neuron_type = neuron_type
+    self.pacc = pacc
+    self.nacc = nacc
+
+  def update(self, result):
+    self.pacc = max(self.pacc,result.pacc)
+    self.nacc = max(self.nacc,result.nacc)
+    
+  # self.training is changed by train() and eval()
+
+  @property
+  def max(self):
+    return max(self.pacc,self.nacc)
+
+  def __repr__(self):
+    assert self.neuron_type
+    return str((self.pacc,self.nacc,math.ceil(self.max/self.neuron_type.qcode_max)))
+
+NEURON_REGISTRY = {
+  'leaky': NpxLeaky,
+  'synaptic': snntorch.Synaptic,
+  'alpha': snntorch.Alpha,
+}
+NEURON_STATE_NAMES = {
+  'leaky': ('mem',),
+  'synaptic': ('syn', 'mem'),
+  'alpha': ('syn_exc', 'syn_inh', 'mem'),
+}
+NEURON_SECTION_NAMES = ('Leaky', 'Synaptic', 'Alpha')
+NEURON_BASE_CLASSES = (snntorch.Leaky, snntorch.Synaptic, snntorch.Alpha)
+
+class NpxModule(nn.Module):
+  def __init__(self, app_cfg_path:Path, neuron_type_class=NpxNeuronType):
+    super().__init__()
+    self.neuron_type_class = neuron_type_class
+    self.app_cfg_path = app_cfg_path
+    if self.app_cfg_path and self.app_cfg_path.is_file():
+      self.cfg_parser = NpxCfgParser()
+      self.cfg_parser.parse_file(self.app_cfg_path)
+      
+      self.layer_sequence = []
+      self.gen_layer_sequence(self.cfg_parser.layer_info_list)
+      # print(net_option, layer_option_list)
+    self.is_network_quantized = False
+
+  @property
+  def is_network_quantized(self):
+    return self._is_network_quantized
+
+  @is_network_quantized.setter
+  def is_network_quantized(self, value:bool):
+    self._is_network_quantized = value
+    for layer in getattr(self, 'layer_sequence', []):
+      if self.is_neuron(layer):
+        layer.is_network_quantized = value
+
+  def global_config(self, option_name:str):
+    return self.cfg_parser.global_info.get(option_name)
+      
+  @property
+  def app_name(self):
+    return app_stem(self.app_cfg_path)
+  
+  @property
+  def dataset_name(self):
+    return self.dataset
+      
+  @property
+  def num_layer(self):
+    return len(self.cfg_parser.layer_info_list)
+  
+  @property
+  def input_size(self):
+    return self.cfg_parser.global_info['input_size']
+  
+  @property
+  def timesteps(self):
+    return self.cfg_parser.preprocess_info['timesteps']
+
+  @classmethod
+  def is_neuron(cls, layer):
+    return isinstance(layer, NEURON_BASE_CLASSES)
+
+  def backup_epoch_cfg(self, cfg_path:Path, overwrite:bool=False):
+    assert overwrite or (not cfg_path.is_file()), cfg_path
+    app_cfg_generator = npx_app_cfg_generator.NpxAppCfgGenerator()
+    app_cfg_generator.import_module(self)
+    app_cfg_generator.write_file(cfg_path)
+  
+  def backup_raw_cfg(self, cfg_path:Path):
+    contents = self.app_cfg_path.read_text()
+    if cfg_path.is_file():
+      previous_contents = cfg_path.read_text()
+      assert contents==previous_contents
+    cfg_path.write_text(contents)
+
+  def backup_cfg(self, npx_define:NpxDefine, epoch_index:int):
+    self.backup_raw_cfg(npx_define.get_parameter_raw_cfg_path())
+    self.backup_epoch_cfg(npx_define.get_parameter_epoch_cfg_path(epoch_index),True)
+
+  def forward(self, x:Tensor):
+    last_tensor = x
+    last_tensor_list = []
+    for i, layer in enumerate(self.layer_sequence):
+      if (type(layer)==nn.Linear) or (type(layer)==nn.Conv2d):
+        last_tensor = self.forward_layer(i, layer, last_tensor)
+      elif isinstance(layer, Shortcut):
+        skip_tensor = last_tensor_list[(i) + layer.skip_from]
+        if layer.has_weight:
+          skip_tensor = self.forward_layer(i, layer, skip_tensor)
+        else:
+          skip_tensor = layer(skip_tensor)
+        last_tensor = last_tensor + skip_tensor
+      elif self.is_neuron(layer):
+        last_tensor = self.forward_neuron(i, layer, last_tensor)
+      else:
+        last_tensor = layer(last_tensor)
+      last_tensor_list.append(last_tensor)
+
+    return last_tensor
+
+  def forward_layer(self, i:int, layer, x:Tensor):
+    if self.training and layer.neuron_type:
+      original_tensor = copy.deepcopy(layer.weight.data)
+      self.update_q_max(layer.neuron)
+      qtensor = layer.neuron_type.quantize_tensor(layer.weight.data, bounded=True)
+      layer.weight.data = layer.neuron_type.dequantize_tensor(qtensor)
+    current = layer(x)
+    if self.training and layer.neuron_type:
+      layer.weight.data = original_tensor
+      layer.neuron_type.clamp_weight_(layer.weight.data, self.is_network_quantized)
+    return current
+      
+  def forward_neuron(self, i:int, neuron, x:Tensor):
+    return neuron(x)
+      
+  def print_parameter(self):
+    for layer in self.layer_sequence:
+      if (type(layer)==nn.Linear) or (type(layer)==nn.Conv2d):
+        print(layer.weight)
+      elif isinstance(layer, Shortcut):
+        if layer.has_weight:
+          print(layer.weight)
+      elif self.is_neuron(layer):
+        print(layer.threshold)
+
+  def update_q_max(self, neuron):
+    weight_list = [layer.weight.data for layer in neuron.weight_layers]
+    neuron.neuron_type.update_q_max(weight_list, neuron.threshold)
+
+  def derive_q_max(self):
+    # the weight scale is otherwise only derived inside a training forward, so a
+    # freshly loaded network cannot convert the register bounds into float units
+    for layer in self.layer_sequence:
+      if self.is_neuron(layer):
+        self.update_q_max(layer)
+
+  def trace_input_factor(self, layer_factor):
+    factor = 1.0
+    factor_list = []
+    neuron_factor_list = []
+    mismatch_list = []
+    for i, layer in enumerate(self.layer_sequence):
+      if (type(layer)==nn.Linear) or (type(layer)==nn.Conv2d):
+        factor = factor * layer_factor(layer)
+      elif isinstance(layer, Shortcut):
+        skip_factor = factor_list[(i) + layer.skip_from]
+        if layer.has_weight:
+          skip_factor = skip_factor * layer_factor(layer)
+        if not math.isclose(skip_factor, factor, rel_tol=1e-9):
+          mismatch_list.append((i, factor, skip_factor))
+      elif self.is_neuron(layer):
+        neuron_factor_list.append((layer, factor))
+        factor = 1.0
+      factor_list.append(factor)
+    return neuron_factor_list, mismatch_list
+
+  def quantize_network(self):
+    assert not self.training
+    self.is_network_quantized = True
+    self.derive_q_max()
+    neuron_factor_list, mismatch_list = self.trace_input_factor(
+      lambda layer: layer.neuron_type.inv_scale if layer.neuron_type.is_quantized else 1.0)
+    assert not mismatch_list, [f'layer {i}: the shortcut adds codes at {skip_factor:.6g}x to codes at {factor:.6g}x'
+                               for i, factor, skip_factor in mismatch_list]
+    for neuron, factor in neuron_factor_list:
+      neuron.input_factor = factor
+    print('[QUANTIZE] input factor per neuron:', ', '.join(f'{factor:.6g}' for _, factor in neuron_factor_list))
+    for layer in self.layer_sequence:
+      if (type(layer)==nn.Linear) or (type(layer)==nn.Conv2d):
+        qtensor = layer.neuron_type.quantize_tensor(layer.weight.data, bounded=True)
+        layer.weight.data = qtensor.tensor.float()
+      elif isinstance(layer, Shortcut):
+        if layer.has_weight:
+          qtensor = layer.neuron_type.quantize_tensor(layer.weight.data, bounded=True)
+          layer.weight.data = qtensor.tensor.float()
+      elif self.is_neuron(layer):
+        qtensor = layer.neuron_type.quantize_threshold(layer.threshold, layer.input_factor)
+        layer.threshold = type(layer.threshold)(qtensor.tensor.float())
+
+  def write_parameter(self, path:Path):
+    assert path.parent.is_dir(), path
+    line_list = []
+    for layer in self.layer_sequence:
+      if (type(layer)==nn.Linear) or (type(layer)==nn.Conv2d):
+        line_list.append(str(layer.weight.tolist()))
+      elif isinstance(layer, Shortcut):
+        if layer.has_weight:
+          line_list.append(str(layer.weight.tolist()))
+      elif self.is_neuron(layer):
+        line_list.append(str(layer.threshold.tolist()))
+        line_list.append(str(layer.beta.tolist()))
+    path.write_text('\n'.join(line_list))
+  
+  def dicide_option_value(self, layer_option:dict, option_name:str, default_value):
+    global_value = self.global_config(option_name)
+    local_value = layer_option.get(option_name)
+    if local_value!=None:
+      result = local_value
+    elif global_value!=None:
+      result = global_value
+    else:
+      result = default_value
+    assert result!=None
+    layer_option[option_name] = result
+    return result
+
+  def gen_layer_sequence(self, layer_option_list):
+    #num_layer = len(layer_option_list)
+    not_assigned_layer_list = []
+    for i, layer_option in enumerate(layer_option_list):
+      #if i == (num_layer-1):
+      #  neuron_output = True
+      #else:
+      #  neuron_output = False
+      
+      if layer_option.name == 'Linear':
+        # synapse option
+        in_features = layer_option.setdefault('in_features', 1)
+        out_features = layer_option.setdefault('out_features', 1)
+        # print(in_features, out_features)
+
+        layer = nn.Linear(in_features, out_features, bias=False)
+        not_assigned_layer_list.append((layer, layer_option))
+        
+      elif layer_option.name == 'Conv2d':
+        # synapse option
+        in_channels = layer_option.setdefault('in_channels', 1)
+        out_channels = layer_option.setdefault('out_channels', 1)
+        kernel_size = layer_option.setdefault('kernel_size', 3)
+        stride = layer_option.setdefault('stride', 1)
+        padding = layer_option.setdefault('padding', 0)
+        groups = layer_option.setdefault('groups', 1)
+        #print(in_channels, out_channels, kernel_size, stride, padding, groups)
+
+        layer = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False, groups=groups)
+        not_assigned_layer_list.append((layer, layer_option))
+
+      elif layer_option.name == 'Shortcut':
+        # synapse option
+        skip_from = layer_option.setdefault('skip_from', 1)
+        shortcut_type = layer_option.setdefault('type', 'Conv2d')
+        in_channels = layer_option.setdefault('in_channels', 1)
+        out_channels = layer_option.setdefault('out_channels', 1)
+        kernel_size = layer_option.setdefault('kernel_size', 1)
+        stride = layer_option.setdefault('stride', 1)
+        padding = layer_option.setdefault('padding', 0)
+        # print(in_channels, out_channels, kernel_size, stride, padding)
+
+        layer = Shortcut(in_channels, out_channels, kernel_size, stride, padding, bias=False, skip_from=skip_from, type=shortcut_type)
+        not_assigned_layer_list.append((layer, layer_option))
+
+      elif layer_option.name == 'MaxPool2d':
+        kernel_size = layer_option.setdefault('kernel_size', 1)
+        stride = layer_option.setdefault('stride', kernel_size)
+        padding = layer_option.setdefault('padding', 0)
+
+        layer = nn.MaxPool2d(kernel_size, stride, padding)
+        not_assigned_layer_list.append((layer, layer_option))
+          
+      elif layer_option.name == 'AvgPool2d':
+        kernel_size = layer_option.setdefault('kernel_size', 1)
+        stride = layer_option.setdefault('stride', kernel_size)
+        padding = layer_option.setdefault('padding', 0)
+
+        layer = nn.AvgPool2d(kernel_size, stride, padding)
+        not_assigned_layer_list.append((layer, layer_option))
+
+      elif layer_option.name == 'Flatten':
+        layer = nn.Flatten()
+        not_assigned_layer_list.append((layer, layer_option))
+
+      elif layer_option.name in NEURON_SECTION_NAMES:
+        #layer = self.make_neuron(layer_option, neuron_output)
+        layer = self.make_neuron(layer_option, False)
+        assert layer.neuron_type
+        layer.weight_layers = []
+        for previous_layer, previous_layer_option in not_assigned_layer_list:
+          if getattr(previous_layer, 'weight', None) is not None:
+            layer.weight_layers.append(previous_layer)
+          previous_layer.neuron = layer
+          previous_layer.neuron_type = layer.neuron_type
+          assert 'neuron_type' not in previous_layer_option
+          previous_layer_option['neuron_type'] = layer.neuron_type.name
+        not_assigned_layer_list = []
+      else:
+        assert 0
+
+      self.add_module('layer' + str(i), layer)
+      self.layer_sequence.append(layer)
+    assert len(not_assigned_layer_list)==0
+    neuron_factor_list, mismatch_list = self.trace_input_factor(lambda layer: 2.0)
+    assert not mismatch_list, [f'layer {i}: the shortcut adds a tensor after {round(math.log2(skip_factor))} weight layers '
+                               f'to one after {round(math.log2(factor))}' for i, factor, skip_factor in mismatch_list]
+    for neuron, factor in neuron_factor_list:
+      neuron.neuron_type.input_depth = round(math.log2(factor))
+    self.share_shortcut_scale()
+    self.widen_direct_input_membrane([neuron for neuron, _ in neuron_factor_list])
+
+  def widen_direct_input_membrane(self, neuron_list):
+    # direct encoding feeds values, not spikes, so the first membrane holds a much
+    # larger sum than the later ones and always gets the full 32-bit register
+    if (not neuron_list) or (self.cfg_parser.preprocess_info.get('step_generation', 'direct') != 'direct'):
+      return
+    neuron_type = neuron_list[0].neuron_type
+    if neuron_type.mem_bits == MAX_MEM_BITS:
+      return
+    previous_name = neuron_type.full_name
+    neuron_type.mem_bits = MAX_MEM_BITS
+    warn_once(('direct input membrane', previous_name),
+              f'the input is not spikes (step_generation=direct), so the first neuron keeps the full'
+              f' membrane register: {previous_name} -> {neuron_type.full_name}')
+
+  def share_shortcut_scale(self):
+    for i, layer in enumerate(self.layer_sequence):
+      if not isinstance(layer, Shortcut) or layer.has_weight:
+        continue
+      source_type = None
+      for j in range((i) + layer.skip_from, -1, -1):
+        source = self.layer_sequence[j]
+        if self.is_neuron(source):
+          break
+        if (type(source)==nn.Linear) or (type(source)==nn.Conv2d) or (isinstance(source, Shortcut) and source.has_weight):
+          source_type = source.neuron_type
+          break
+      if source_type is None:
+        continue
+      if layer.neuron_type is not source_type:
+        layer.neuron_type.q_max_source = source_type
+
+  def make_neuron(self, layer_option, neuron_output):
+    neuron_type_str = self.dicide_option_value(layer_option, 'neuron_type', 'ws8')
+    neuron_type = self.neuron_type_class(neuron_type_str)
+    layer_option['neuron_type'] = neuron_type.name
+    
+    beta = self.dicide_option_value(layer_option, 'beta', 1.0)
+    beta = neuron_type.quantize_beta(beta)
+    layer_option['beta'] = beta
+    
+    learn_beta = self.dicide_option_value(layer_option, 'learn_beta', False)
+    neuron_type.learn_beta = learn_beta
+    
+    reset_mechanism = self.dicide_option_value(layer_option, 'reset_mechanism', 'subtract')    
+    overflow_headroom = self.dicide_option_value(layer_option, 'overflow_headroom', DEFAULT_OVERFLOW_HEADROOM)
+    neuron_type.configure_membrane(reset_mechanism, overflow_headroom)
+    reset_delay = self.dicide_option_value(layer_option, 'reset_delay', True)
+    
+    threshold = self.dicide_option_value(layer_option, 'threshold', 1.0)
+    learn_threshold = self.dicide_option_value(layer_option, 'learn_threshold', False)
+    neuron_type.learn_threshold = learn_threshold
+
+    # Surrogate-gradient width, tied to each layer's own threshold.
+    #
+    # The default (spike_grad=None) is snntorch's atan surrogate at alpha=2,
+    # whose half-width 2/(pi*alpha)=0.318 is an *absolute* distance in membrane
+    # units. Each layer's membrane scale tracks its own threshold, so once
+    # thresholds are calibrated per layer one fixed window fits them all badly:
+    # at thresholds 0.087..0.487 that same 0.318 is 3.7x the threshold in the
+    # shallow layers -- gradient nearly constant, so they stop discriminating
+    # near-threshold inputs -- and 0.65x in the deep ones.
+    #
+    # fast_sigmoid is used rather than atan because its gradient
+    #   1 / (slope*|mem-threshold| + 1)**2
+    # peaks at 1.0 for every slope, so changing slope changes the width and
+    # nothing else. atan is normalised to unit *integral* instead, meaning its
+    # peak is alpha/2 -- narrowing it there also multiplies the gradient (11x in
+    # the shallow layers at alpha=2/threshold), which compounds across layers
+    # and silences the network exactly as too large an lr does.
+    #
+    # `surrogate_scale` is the slope you would want at threshold=1.0; the slope
+    # actually used is surrogate_scale/threshold, so the window stays a fixed
+    # fraction of threshold in every layer. Half-width is 0.4142/slope, so
+    # surrogate_scale=1.3 reproduces the default 0.318 window at threshold=1.0.
+    # Unset (or 0) keeps the previous behaviour exactly, so existing apps are
+    # unaffected. Training-only: it never reaches the riscv network cfg.
+    surrogate_scale = self.dicide_option_value(layer_option, 'surrogate_scale', 0)
+    if surrogate_scale:
+      assert threshold > 0, f'surrogate_scale needs threshold>0 (got {threshold})'
+      spike_grad = surrogate.fast_sigmoid(slope=float(surrogate_scale)/float(threshold))
+    else:
+      spike_grad = None
+    neuron = NpxLeaky(neuron_type, beta=beta, learn_beta=learn_beta, spike_grad=spike_grad, threshold=threshold, learn_threshold=learn_threshold,
+                      init_hidden=True, reset_delay=reset_delay, reset_mechanism=reset_mechanism, output=neuron_output)
+
+    return neuron
+
+class Shortcut(nn.Module):
+    SUPPORTED_TYPES = ('Identity', 'Conv2d', 'MaxPool2d', 'AvgPool2d')
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias, skip_from, type="Conv2d"):
+        super().__init__()
+
+        self.skip_from = skip_from
+        self.shortcut_type = type
+
+        if self.shortcut_type == "Conv2d":
+            self.op = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=bias)
+            self.weight = self.op.weight
+        elif self.shortcut_type == "Identity":
+            self.op = nn.Identity()
+            self.weight = None
+        elif self.shortcut_type == "MaxPool2d":
+            self.op = nn.MaxPool2d(kernel_size, stride, padding)
+            self.weight = None
+        elif self.shortcut_type == "AvgPool2d":
+            self.op = nn.AvgPool2d(kernel_size, stride, padding)
+            self.weight = None
+        else:
+            raise ValueError(f"Unknown type: {self.shortcut_type}")
+
+    @property
+    def has_weight(self):
+        return self.shortcut_type == "Conv2d"
+
+    def forward(self, x):
+        result = self.op(x)
+        if (self.shortcut_type == "AvgPool2d") and (not self.training):
+            result = torch.trunc(result)
+        return result
