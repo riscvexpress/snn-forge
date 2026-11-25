@@ -1,20 +1,43 @@
 SNN_FORGE_HOME:=$(CURDIR)
 .DEFAULT_GOAL:=app_list
 
-include ./rvx_init.mh
+ifdef RVX_RELEASE_HOME
+export RVX_UTIL_HOME=${RVX_RELEASE_HOME}/rvx_util
+endif
 
-DATASET_DIR=${SNN_FORGE_HOME}/dataset
+include ./rvx_init.mh
+-include ./rvx_config_path.mh
+
+DATASET_DIR?=${SNN_FORGE_HOME}/dataset
 
 ###########
 ## SETUP ##
 ###########
 
-config:
+setup_dev_env:
 ifeq ($(OS),Windows_NT)
 	setx SNN_FORGE_HOME $(CURDIR)
 else
 	${PYTHON3_CMD} ${RVX_UTIL_HOME}/configure_template.py -i ./rvx_setup.sh.template -o ./rvx_setup.sh -c CURDIR=$(CURDIR)
 endif
+
+# e.g. make setup_path DATASET_DIR=/data/snn-forge/dataset
+setup_path:
+	${PYTHON3_CMD} ${RVX_UTIL_HOME}/configure_template.py -i ./rvx_config_path.mh.template -o ./rvx_config_path.mh -c "DATASET_DIR=$(abspath ${DATASET_DIR})"
+	@cat ./rvx_config_path.mh
+
+# if ../.. is xarvis (has share_dataset), let it share its dataset with this project
+DATASET_XARVIS_DIR?=$(abspath ${CURDIR}/../..)
+
+setup_dataset:
+	@if { MAKEFLAGS= ${MAKE} -q -C "${DATASET_XARVIS_DIR}" share_dataset >/dev/null 2>&1; [ $$? -ne 2 ]; }; then \
+	  echo "make share_dataset in ${DATASET_XARVIS_DIR}"; \
+	  MAKEFLAGS= ${MAKE} --no-print-directory -C "${DATASET_XARVIS_DIR}" share_dataset "DATASET_SHARE_DIR=${CURDIR}" || exit 1; \
+	else \
+	  echo "skipped: ${DATASET_XARVIS_DIR} has no share_dataset, so ${DATASET_DIR} is used"; \
+	fi
+
+.PHONY: setup_dataset
 
 preinstall:
 	@echo Checking OS type...
@@ -37,7 +60,7 @@ endif
 #${PYTHON3_CMD} -m pip install sqlite3
 #${PYTHON3_CMD} -m pip install numpy==1.26.4 # numpy must be < 2.0
 
-install: install_verified
+install: setup_dataset install_verified
 
 install_verified: install_verified_202607
 

@@ -33,7 +33,6 @@ Run the following in the top directory of this repository.
 ```sh
 make setup_python     # copy ../rvx_config_python.mh, or install Python 3.9 into ./.rvx_venv
 make check_python     # confirm the selected Python
-make config           # generate ./rvx_setup.sh (Windows: register SNN_FORGE_HOME with setx)
 make install          # install the Python packages (PyTorch, snnTorch, tonic, NIR, ...)
 ```
 
@@ -64,11 +63,6 @@ The selected build is printed as `torch backend: ...`. To choose it yourself:
 ```sh
 make install TORCH_BACKEND=cpu
 ```
-
-## Setup
-
-- Linux: run `source ./rvx_setup.sh` in every new terminal.
-- Windows: open a new terminal, since `SNN_FORGE_HOME` is registered with `setx`.
 
 ## Usage
 
