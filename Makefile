@@ -83,7 +83,7 @@ TORCH_BACKEND := $(shell ver=$$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Versio
 endif
 
 install_verified_202607:
-	@echo "torch backend: $(TORCH_BACKEND)"
+	$(info torch backend: $(TORCH_BACKEND))
 	${PYTHON3_CMD} -m pip install pandas matplotlib tqdm==4.68.3 tonic==1.6.0
 	${PYTHON3_CMD} -m pip install torch==2.8.0+$(TORCH_BACKEND) torchvision==0.23.0+$(TORCH_BACKEND) torchaudio==2.8.0+$(TORCH_BACKEND) --extra-index-url https://download.pytorch.org/whl/$(TORCH_BACKEND)
 	${PYTHON3_CMD} -m pip install snntorch==1.0.0
